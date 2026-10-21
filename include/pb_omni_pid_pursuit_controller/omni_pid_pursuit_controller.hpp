@@ -196,6 +196,11 @@ protected:
    */
   bool isCollisionDetected(const nav_msgs::msg::Path & path);
 
+  // Distance along a path before the swept circular footprint reaches occupied,
+  // unknown, or out-of-map space. Uses the costmap global frame.
+  double obstacleDistance(
+    const nav_msgs::msg::Path & path, const geometry_msgs::msg::PoseStamped & start) const;
+
 private:
   /**
    * @brief Applies curvature based speed limitation
@@ -265,7 +270,8 @@ private:
   nav2_costmap_2d::Costmap2D * costmap_;
   rclcpp::Logger logger_{rclcpp::get_logger("OmniPidPursuitController")};
   rclcpp::Clock::SharedPtr clock_;
-  double last_velocity_scaling_factor_;
+  double last_velocity_scaling_factor_{1.0};
+  double max_lateral_accel_{0.0};
 
   std::shared_ptr<PID> move_pid_;
   std::shared_ptr<PID> heading_pid_;
@@ -297,6 +303,10 @@ private:
   double curvature_forward_dist_;
   double curvature_backward_dist_;
   double max_velocity_scaling_factor_rate_;
+  double obstacle_slowdown_distance_{0.0};
+  double obstacle_stop_margin_{0.1};
+  double obstacle_deceleration_{2.0};
+  double obstacle_reaction_time_{0.3};
   tf2::Duration transform_tolerance_;
 
   nav_msgs::msg::Path global_plan_;

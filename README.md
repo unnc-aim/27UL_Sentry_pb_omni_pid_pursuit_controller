@@ -35,7 +35,7 @@
 | `reduction_ratio_at_high_curvature` | The speed reduction ratio at high curvature. 0.5 means a 50% reduction. |
 | `curvature_forward_dist` | The forward distance used for curvature calculation. |
 | `curvature_backward_dist` | The backward distance used for curvature calculation. |
-| `max_velocity_scaling_factor_rate` | The maximum rate of change for the velocity scaling factor. |
+| `max_velocity_scaling_factor_rate` | The maximum recovery rate per second for the dimensionless curvature speed factor. Lower curve limits apply immediately; the downstream velocity smoother controls acceleration and braking. |
 | `max_robot_pose_search_dist` | The maximum distance along the path to search for the robot's closest pose, used to keep the robot on the planned path. |
 
 Example fully-described XML with default parameter values:
@@ -94,3 +94,15 @@ controller_server:
       curvature_backward_dist: 0.3
       max_velocity_scaling_factor_rate: 0.9
 ```
+
+Curvature scaling keeps its factor between zero and one. A lower curve limit takes effect on the next controller command, and the factor recovers gradually when replanning produces a straighter path. This recovery also applies when crossing back below `curvature_min`. Use the Nav2 velocity smoother to enforce physical acceleration and deceleration limits. Goal approach scaling and collision stops remain active.
+
+## Obstacle distance braking
+
+`obstacle_slowdown_distance` enables checking a forward path length in meters; its default `0.0` retains the original path collision mode. Odin sets this range from the usable local costmap extent. The controller samples each path segment at half a grid cell and sweeps the robot's circumscribed footprint, including cell area. It also checks the direct pursuit segment toward the lookahead point. Occupied cells, unknown cells and the map boundary constrain available travel.
+
+The commanded speed satisfies `v * obstacle_reaction_time + v² / (2 * obstacle_deceleration) <= distance - obstacle_stop_margin`. Defaults are `0.3 s`, `2.0 m/s²`, and `0.1 m`, respectively. This limit is applied after goal approach scaling, so an obstacle can reduce the command below the goal's crawl speed and all the way to zero. Current footprint overlap still triggers a collision stop. A future obstruction allows gradual braking and waiting for replanning or clearance. The existing Nav2 smoother limits acceleration when space becomes available again.
+
+These parameters describe static geometry and an assumed braking capability. Dynamic objects are handled through successive costmap observations. The speed limit uses the geometry in the current observation. Actual stopping travel depends on drive response, data freshness and the configured footprint. Test measured braking before using the full navigation speed. Configure X/Y smoother deceleration consistently with `obstacle_deceleration`.
+
+`max_lateral_accel` enables braking before upcoming bends when positive (default `0.0` preserves the original curvature handling). Odin uses `1.5 m/s²`, matching its planar acceleration setting. The controller samples coarse curvature over the forward braking range, computes a turn speed from lateral acceleration, and accounts for deceleration and reaction time before the bend. This applies to intermediate route points as well as the local lookahead. The existing curvature factor stores the resulting limit so replanning past a waypoint restores speed gradually. Final-goal stop checks remain separate.

@@ -14,6 +14,9 @@
 
 #include "pb_omni_pid_pursuit_controller/omni_pid_pursuit_controller.hpp"
 
+#include <limits>
+#include <stdexcept>
+
 #include "nav2_core/exceptions.hpp"
 #include "nav2_util/geometry_utils.hpp"
 #include "nav2_util/node_utils.hpp"
@@ -26,6 +29,16 @@ using std::max;
 using std::min;
 using namespace nav2_costmap_2d;  // NOLINT
 using rcl_interfaces::msg::ParameterType;
+
+namespace
+{
+bool validObstacleParameters(double range, double margin, double deceleration, double reaction)
+{
+  return std::isfinite(range) && std::isfinite(margin) && std::isfinite(deceleration) &&
+         std::isfinite(reaction) && range >= 0.0 && margin >= 0.0 && deceleration > 0.0 &&
+         reaction >= 0.0 && (range == 0.0 || range > margin);
+}
+}  // namespace
 
 namespace pb_omni_pid_pursuit_controller
 {
@@ -156,6 +169,30 @@ void OmniPidPursuitController::configure(
   node->get_parameter(
     plugin_name_ + ".max_velocity_scaling_factor_rate", max_velocity_scaling_factor_rate_);
 
+  declare_parameter_if_not_declared(
+    node, plugin_name_ + ".obstacle_slowdown_distance", rclcpp::ParameterValue(0.0));
+  declare_parameter_if_not_declared(
+    node, plugin_name_ + ".obstacle_stop_margin", rclcpp::ParameterValue(0.1));
+  declare_parameter_if_not_declared(
+    node, plugin_name_ + ".obstacle_deceleration", rclcpp::ParameterValue(2.0));
+  declare_parameter_if_not_declared(
+    node, plugin_name_ + ".obstacle_reaction_time", rclcpp::ParameterValue(0.3));
+  node->get_parameter(plugin_name_ + ".obstacle_slowdown_distance", obstacle_slowdown_distance_);
+  node->get_parameter(plugin_name_ + ".obstacle_stop_margin", obstacle_stop_margin_);
+  node->get_parameter(plugin_name_ + ".obstacle_deceleration", obstacle_deceleration_);
+  node->get_parameter(plugin_name_ + ".obstacle_reaction_time", obstacle_reaction_time_);
+  if (!validObstacleParameters(obstacle_slowdown_distance_, obstacle_stop_margin_,
+      obstacle_deceleration_, obstacle_reaction_time_))
+  {
+    throw std::invalid_argument("Invalid obstacle braking distances, deceleration or reaction time");
+  }
+
+  declare_parameter_if_not_declared(
+    node, plugin_name_ + ".max_lateral_accel", rclcpp::ParameterValue(0.0));
+  node->get_parameter(plugin_name_ + ".max_lateral_accel", max_lateral_accel_);
+  if (!std::isfinite(max_lateral_accel_) || max_lateral_accel_ < 0.0) {
+    throw std::invalid_argument("max_lateral_accel requires a finite nonnegative value");
+  }
   node->get_parameter("controller_frequency", control_frequency);
 
   transform_tolerance_ = tf2::durationFromSec(transform_tolerance);
@@ -218,7 +255,7 @@ void OmniPidPursuitController::deactivate()
 
 geometry_msgs::msg::TwistStamped OmniPidPursuitController::computeVelocityCommands(
   const geometry_msgs::msg::PoseStamped & pose, const geometry_msgs::msg::Twist & velocity,
-  nav2_core::GoalChecker * /*goal_checker*/)
+  nav2_core::GoalChecker * goal_checker)
 {
   std::lock_guard<std::mutex> lock_reinit(mutex_);
 
@@ -252,28 +289,77 @@ geometry_msgs::msg::TwistStamped OmniPidPursuitController::computeVelocityComman
 
   applyApproachVelocityScaling(transformed_plan, lin_vel);
 
-  // Transform local frame to global frame to use in collision checking
-  nav_msgs::msg::Path costmap_frame_local_plan;
+  // Let a stopped goal checker observe deceleration after reaching the position.
+  // Use the full path goal, since the local path can end at the costmap boundary.
+  geometry_msgs::msg::Pose pose_tolerance;
+  geometry_msgs::msg::Twist velocity_tolerance;
+  if (goal_checker && goal_checker->getTolerances(pose_tolerance, velocity_tolerance)) {
+    const double tolerance = std::min(pose_tolerance.position.x, pose_tolerance.position.y);
+    if (std::isfinite(tolerance) && tolerance >= 0.0) {
+      auto goal = global_plan_.poses.back();
+      goal.header.frame_id = global_plan_.header.frame_id;
+      goal.header.stamp = pose.header.stamp;
+      geometry_msgs::msg::PoseStamped goal_in_pose_frame;
+      if (!transformPose(pose.header.frame_id, goal, goal_in_pose_frame)) {
+        throw nav2_core::PlannerException("Unable to transform the final goal for stopping");
+      }
+      const double dx = goal_in_pose_frame.pose.position.x - pose.pose.position.x;
+      const double dy = goal_in_pose_frame.pose.position.y - pose.pose.position.y;
+      if (dx * dx + dy * dy <= tolerance * tolerance) {
+        lin_vel = 0.0;
+      }
+    }
+  }
 
-  int sample_points = 10;
-  int plan_size = transformed_plan.poses.size();
-  for (int i = 0; i < sample_points; ++i) {
-    int index = std::min((i * plan_size) / sample_points, plan_size - 1);
+  // Use every path segment. A fixed ten-point sample can skip a thin obstacle.
+  nav_msgs::msg::Path costmap_frame_local_plan;
+  costmap_frame_local_plan.header.frame_id = costmap_ros_->getGlobalFrameID();
+  for (const auto & point : transformed_plan.poses) {
     geometry_msgs::msg::PoseStamped map_pose;
-    transformPose(costmap_ros_->getGlobalFrameID(), transformed_plan.poses[index], map_pose);
+    if (!transformPose(costmap_ros_->getGlobalFrameID(), point, map_pose)) {
+      throw nav2_core::PlannerException("Path transform failed during collision checking");
+    }
     costmap_frame_local_plan.poses.push_back(map_pose);
+  }
+
+  if (obstacle_slowdown_distance_ > 0.0) {
+    geometry_msgs::msg::PoseStamped start, carrot;
+    auto motion_point = carrot_pose;
+    if (lin_vel < 0.0) {
+      motion_point.pose.position.x *= -1.0;
+      motion_point.pose.position.y *= -1.0;
+    }
+    if (!transformPose(costmap_ros_->getGlobalFrameID(), pose, start) ||
+      !transformPose(costmap_ros_->getGlobalFrameID(), motion_point, carrot))
+    {
+      throw nav2_core::PlannerException("Motion transform failed during collision checking");
+    }
+    // Also check the actual command chord: pursuit can cut the inside of a curve.
+    nav_msgs::msg::Path chord;
+    chord.poses.push_back(carrot);
+    const double distance = std::min(
+      obstacleDistance(costmap_frame_local_plan, start), obstacleDistance(chord, start));
+    if (distance <= 0.0) {
+      throw nav2_core::PlannerException("Robot footprint overlaps occupied or unknown space");
+    }
+    if (std::isfinite(distance)) {
+      const double clearance = std::max(0.0, distance - obstacle_stop_margin_);
+      const double reaction_velocity = obstacle_deceleration_ * obstacle_reaction_time_;
+      // v * reaction + v^2 / (2 * deceleration) <= remaining clearance.
+      const double limit = std::sqrt(
+        reaction_velocity * reaction_velocity + 2.0 * obstacle_deceleration_ * clearance) -
+        reaction_velocity;
+      lin_vel = std::copysign(std::min(std::abs(lin_vel), limit), lin_vel);
+    }
+  } else if (isCollisionDetected(costmap_frame_local_plan)) {
+    throw nav2_core::PlannerException("Collision detected in the trajectory. Stopping the robot!");
   }
 
   geometry_msgs::msg::TwistStamped cmd_vel;
   cmd_vel.header = pose.header;
-  if (!isCollisionDetected(costmap_frame_local_plan)) {
-    cmd_vel.twist.linear.x = lin_vel * cos(theta_dist);
-    cmd_vel.twist.linear.y = lin_vel * sin(theta_dist);
-    cmd_vel.twist.angular.z = angular_vel;
-  } else {
-    throw nav2_core::PlannerException("Collision detected in the trajectory. Stopping the robot!");
-  }
-
+  cmd_vel.twist.linear.x = lin_vel * cos(theta_dist);
+  cmd_vel.twist.linear.y = lin_vel * sin(theta_dist);
+  cmd_vel.twist.angular.z = angular_vel;
   return cmd_vel;
 }
 
@@ -469,6 +555,76 @@ bool OmniPidPursuitController::isCollisionDetected(const nav_msgs::msg::Path & p
   return false;
 }
 
+double OmniPidPursuitController::obstacleDistance(
+  const nav_msgs::msg::Path & path, const geometry_msgs::msg::PoseStamped & start) const
+{
+  const double resolution = costmap_->getResolution();
+  const double step = resolution * 0.5;
+  // Cover all chassis yaw angles during spin, and the occupied cell's square area.
+  const double radius = costmap_ros_->getLayeredCostmap()->getCircumscribedRadius() +
+    std::sqrt(2.0) * resolution * 0.5;
+  const int cells = static_cast<int>(std::ceil(radius / resolution)) + 1;
+  auto clear = [&](double x, double y) {
+      unsigned int mx, my;
+      if (!std::isfinite(x) || !std::isfinite(y) || !costmap_->worldToMap(x, y, mx, my)) {
+        return false;
+      }
+      if (costmap_->getCost(mx, my) >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+        return false;
+      }
+      for (int dx = -cells; dx <= cells; ++dx) {
+        for (int dy = -cells; dy <= cells; ++dy) {
+          const int cx = static_cast<int>(mx) + dx;
+          const int cy = static_cast<int>(my) + dy;
+          const double wx = costmap_->getOriginX() + (cx + 0.5) * resolution;
+          const double wy = costmap_->getOriginY() + (cy + 0.5) * resolution;
+          if ((wx - x) * (wx - x) + (wy - y) * (wy - y) > radius * radius) {
+            continue;
+          }
+          if (cx < 0 || cy < 0 || cx >= static_cast<int>(costmap_->getSizeInCellsX()) ||
+            cy >= static_cast<int>(costmap_->getSizeInCellsY()) ||
+            costmap_->getCost(cx, cy) >= nav2_costmap_2d::LETHAL_OBSTACLE)
+          {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+  auto previous = start.pose.position;
+  if (!clear(previous.x, previous.y)) {
+    return 0.0;
+  }
+  double travelled = 0.0;
+  for (const auto & point : path.poses) {
+    const auto & next = point.pose.position;
+    const double length = std::hypot(next.x - previous.x, next.y - previous.y);
+    if (!std::isfinite(length)) {
+      throw nav2_core::PlannerException("Path contains non-finite coordinates");
+    }
+    if (length < 1e-9) {
+      continue;
+    }
+    const double checked = std::min(length, obstacle_slowdown_distance_ - travelled);
+    const int samples = static_cast<int>(std::ceil(checked / step));
+    for (int i = 1; i <= samples; ++i) {
+      const double distance = std::min(i * step, checked);
+      const double u = distance / length;
+      if (!clear(previous.x + u * (next.x - previous.x),
+        previous.y + u * (next.y - previous.y)))
+      {
+        return std::max(0.0, travelled + distance - step);
+      }
+    }
+    travelled += checked;
+    if (travelled >= obstacle_slowdown_distance_) {
+      break;
+    }
+    previous = next;
+  }
+  return std::numeric_limits<double>::infinity();
+}
+
 double OmniPidPursuitController::getLookAheadDistance(const geometry_msgs::msg::Twist & speed)
 {
   // If using velocity-scaled look ahead distances, find and clamp the dist
@@ -523,27 +679,55 @@ void OmniPidPursuitController::applyCurvatureLimitation(
   double curvature =
     calculateCurvature(path, lookahead_pose, curvature_forward_dist_, curvature_backward_dist_);
 
-  double scaled_linear_vel = linear_vel;
+  double reduction_ratio = 1.0;
   if (curvature > curvature_min_) {
-    double reduction_ratio = 1.0;
     if (curvature > curvature_max_) {
       reduction_ratio = reduction_ratio_at_high_curvature_;
     } else {
       reduction_ratio = 1.0 - (curvature - curvature_min_) / (curvature_max_ - curvature_min_) *
                                 (1.0 - reduction_ratio_at_high_curvature_);
     }
-
-    double target_scaled_vel = linear_vel * reduction_ratio;
-    scaled_linear_vel =
-      last_velocity_scaling_factor_ + std::clamp(
-                                        target_scaled_vel - last_velocity_scaling_factor_,
-                                        -max_velocity_scaling_factor_rate_ * control_duration_,
-                                        max_velocity_scaling_factor_rate_ * control_duration_);
   }
-  scaled_linear_vel = std::max(scaled_linear_vel, 2.0 * min_approach_linear_velocity_);
 
-  linear_vel = std::min(linear_vel, scaled_linear_vel);
-  last_velocity_scaling_factor_ = linear_vel;
+  // Keep this state dimensionless. Apply the lower curve speed immediately;
+  // the downstream velocity smoother controls physical deceleration. Recover
+  // the factor gradually on straighter paths, including after replanning.
+  const double floor_ratio = linear_vel > 0.0 ?
+    2.0 * min_approach_linear_velocity_ / linear_vel : 1.0;
+  double target_factor = std::clamp(std::max(reduction_ratio, floor_ratio), 0.0, 1.0);
+  if (max_lateral_accel_ > 0.0 && obstacle_slowdown_distance_ > 0.0 &&
+    std::abs(linear_vel) > 1e-9 && path.poses.size() >= 3)
+  {
+    // Inspect upcoming bends by path length, including intermediate waypoints.
+    // The near lookahead alone starts braking too late after a long straight.
+    const auto distances = calculateCumulativeDistances(path);
+    const double end = std::min(distances.back(), obstacle_slowdown_distance_);
+    const double interval = std::max(0.1, 2.0 * costmap_->getResolution());
+    const double initial_offset = std::hypot(
+      path.poses.front().pose.position.x, path.poses.front().pose.position.y);
+    for (double along = 0.0; along < end + interval; along += interval) {
+      const double center_distance = std::min(along, end);
+      const auto before = findPoseAtDistance(path, distances, center_distance - curvature_backward_dist_);
+      const auto center = findPoseAtDistance(path, distances, center_distance);
+      const auto after = findPoseAtDistance(path, distances, center_distance + curvature_forward_dist_);
+      const double kappa = 1.0 / calculateCurvatureRadius(
+        before.pose.position, center.pose.position, after.pose.position);
+      if (kappa <= curvature_min_) {
+        continue;
+      }
+      const double turn_speed = std::min(v_linear_max_, std::sqrt(max_lateral_accel_ / kappa));
+      const double distance = std::max(0.0, center_distance - curvature_backward_dist_ - initial_offset);
+      const double reaction_velocity = obstacle_deceleration_ * obstacle_reaction_time_;
+      const double limit = std::max(turn_speed, std::sqrt(
+        reaction_velocity * reaction_velocity + turn_speed * turn_speed +
+        2.0 * obstacle_deceleration_ * distance) - reaction_velocity);
+      target_factor = std::min(target_factor, limit / std::abs(linear_vel));
+    }
+  }
+  last_velocity_scaling_factor_ = std::min(
+    target_factor, last_velocity_scaling_factor_ +
+    std::max(0.0, max_velocity_scaling_factor_rate_) * control_duration_);
+  linear_vel *= last_velocity_scaling_factor_;
 }
 
 double OmniPidPursuitController::calculateCurvature(
@@ -688,11 +872,54 @@ rcl_interfaces::msg::SetParametersResult OmniPidPursuitController::dynamicParame
   std::lock_guard<std::mutex> lock_reinit(mutex_);
 
   for (const auto & parameter : parameters) {
+    if (parameter.get_name() == plugin_name_ + ".max_lateral_accel" &&
+      (parameter.get_type() != ParameterType::PARAMETER_DOUBLE ||
+      !std::isfinite(parameter.as_double()) || parameter.as_double() < 0.0))
+    {
+      result.successful = false;
+      result.reason = "max_lateral_accel requires a finite nonnegative value";
+      return result;
+    }
+  }
+  double range = obstacle_slowdown_distance_, margin = obstacle_stop_margin_;
+  double deceleration = obstacle_deceleration_, reaction = obstacle_reaction_time_;
+  for (const auto & parameter : parameters) {
+    const auto & name = parameter.get_name();
+    if (name != plugin_name_ + ".obstacle_slowdown_distance" &&
+      name != plugin_name_ + ".obstacle_stop_margin" &&
+      name != plugin_name_ + ".obstacle_deceleration" &&
+      name != plugin_name_ + ".obstacle_reaction_time")
+    {
+      continue;
+    }
+    if (parameter.get_type() != ParameterType::PARAMETER_DOUBLE) {
+      result.successful = false;
+      result.reason = "Obstacle braking parameters require floating-point values";
+      return result;
+    }
+    if (name == plugin_name_ + ".obstacle_slowdown_distance") range = parameter.as_double();
+    if (name == plugin_name_ + ".obstacle_stop_margin") margin = parameter.as_double();
+    if (name == plugin_name_ + ".obstacle_deceleration") deceleration = parameter.as_double();
+    if (name == plugin_name_ + ".obstacle_reaction_time") reaction = parameter.as_double();
+  }
+  if (!validObstacleParameters(range, margin, deceleration, reaction)) {
+    result.successful = false;
+    result.reason = "Invalid obstacle braking distances, deceleration or reaction time";
+    return result;
+  }
+  obstacle_slowdown_distance_ = range;
+  obstacle_stop_margin_ = margin;
+  obstacle_deceleration_ = deceleration;
+  obstacle_reaction_time_ = reaction;
+
+  for (const auto & parameter : parameters) {
     const auto & type = parameter.get_type();
     const auto & name = parameter.get_name();
 
     if (type == ParameterType::PARAMETER_DOUBLE) {
-      if (name == plugin_name_ + ".translation_kp") {
+      if (name == plugin_name_ + ".max_lateral_accel") {
+        max_lateral_accel_ = parameter.as_double();
+      } else if (name == plugin_name_ + ".translation_kp") {
         translation_kp_ = parameter.as_double();
       } else if (name == plugin_name_ + ".translation_ki") {
         translation_ki_ = parameter.as_double();

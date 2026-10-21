@@ -17,6 +17,13 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
 )
 
 if(BUILD_TESTING)
+  find_package(nav2_controller REQUIRED)
+  add_executable(test_goal_stop test/test_goal_stop.cpp)
+  target_link_libraries(test_goal_stop ${PROJECT_NAME})
+  ament_target_dependencies(test_goal_stop nav2_controller nav2_core nav2_costmap_2d tf2_ros)
+  add_test(NAME test_goal_stop COMMAND test_goal_stop)
+  set_tests_properties(test_goal_stop PROPERTIES TIMEOUT 20
+    ENVIRONMENT "ROS_DOMAIN_ID=95;ROS_LOCALHOST_ONLY=1")
   set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_SOURCE_DIR}/.clang-format")
   set(ament_cmake_clang_tidy_CONFIG_FILE "${CMAKE_SOURCE_DIR}/.clang-tidy")
   find_package(ament_lint_auto REQUIRED)
