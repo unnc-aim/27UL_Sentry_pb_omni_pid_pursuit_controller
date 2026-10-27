@@ -265,10 +265,62 @@ geometry_msgs::msg::TwistStamped OmniPidPursuitController::computeVelocityComman
   // Transform path to robot base frame
   auto transformed_plan = transformGlobalPlan(pose);
 
+  // Use every path segment. A fixed ten-point sample can skip a thin obstacle.
+  nav_msgs::msg::Path costmap_frame_local_plan;
+  costmap_frame_local_plan.header.frame_id = costmap_ros_->getGlobalFrameID();
+  for (const auto & point : transformed_plan.poses) {
+    geometry_msgs::msg::PoseStamped map_pose;
+    if (!transformPose(costmap_ros_->getGlobalFrameID(), point, map_pose)) {
+      throw nav2_core::PlannerException("Path transform failed during collision checking");
+    }
+    costmap_frame_local_plan.poses.push_back(map_pose);
+  }
+
+
   // Find look ahead distance and point on path and publish
   double lookahead_dist = getLookAheadDistance(velocity);
 
   auto carrot_pose = getLookAheadPoint(lookahead_dist, transformed_plan);
+  double pursuit_speed_limit = std::numeric_limits<double>::infinity();
+  if (obstacle_slowdown_distance_ > 0.0) {
+    geometry_msgs::msg::PoseStamped start;
+    if (!transformPose(costmap_ros_->getGlobalFrameID(), pose, start)) {
+      throw nav2_core::PlannerException("Unable to transform pursuit origin");
+    }
+    auto chordDistance = [&](const geometry_msgs::msg::PoseStamped & target) {
+        geometry_msgs::msg::PoseStamped end;
+        if (!transformPose(costmap_ros_->getGlobalFrameID(), target, end)) {
+          throw nav2_core::PlannerException("Unable to transform pursuit target");
+        }
+        nav_msgs::msg::Path chord;
+        chord.poses.push_back(end);
+        return obstacleDistance(chord, start);
+      };
+    const double path_distance = obstacleDistance(costmap_frame_local_plan, start);
+    if (chordDistance(carrot_pose) + costmap->getResolution() < path_distance) {
+      // The path can bend around an obstacle while the pursuit chord cuts it.
+      // Follow a nearer clear point before attempting the longer chord again.
+      const double minimum = 2.0 * costmap->getResolution();
+      double distance = lookahead_dist;
+      while (distance > minimum) {
+        distance = std::max(minimum, distance * 0.5);
+        auto candidate = getLookAheadPoint(distance, transformed_plan);
+        if (std::isfinite(chordDistance(candidate))) {
+          continue;
+        }
+        carrot_pose = candidate;
+        const double checked_distance = std::max(
+          0.0, std::hypot(candidate.pose.position.x, candidate.pose.position.y) -
+          costmap->getResolution() * 0.5);
+        const double reaction_velocity = obstacle_deceleration_ * obstacle_reaction_time_;
+        // Keep the braking distance within the checked shorter segment.
+        pursuit_speed_limit = std::sqrt(
+          reaction_velocity * reaction_velocity +
+          2.0 * obstacle_deceleration_ * checked_distance) - reaction_velocity;
+        break;
+      }
+    }
+  }
   carrot_pub_->publish(createCarrotMsg(carrot_pose));
 
   double lin_dist = hypot(carrot_pose.pose.position.x, carrot_pose.pose.position.y);
@@ -288,6 +340,7 @@ geometry_msgs::msg::TwistStamped OmniPidPursuitController::computeVelocityComman
   applyCurvatureLimitation(transformed_plan, carrot_pose, lin_vel);
 
   applyApproachVelocityScaling(transformed_plan, lin_vel);
+  lin_vel = std::copysign(std::min(std::abs(lin_vel), pursuit_speed_limit), lin_vel);
 
   // Let a stopped goal checker observe deceleration after reaching the position.
   // Use the full path goal, since the local path can end at the costmap boundary.
@@ -311,16 +364,6 @@ geometry_msgs::msg::TwistStamped OmniPidPursuitController::computeVelocityComman
     }
   }
 
-  // Use every path segment. A fixed ten-point sample can skip a thin obstacle.
-  nav_msgs::msg::Path costmap_frame_local_plan;
-  costmap_frame_local_plan.header.frame_id = costmap_ros_->getGlobalFrameID();
-  for (const auto & point : transformed_plan.poses) {
-    geometry_msgs::msg::PoseStamped map_pose;
-    if (!transformPose(costmap_ros_->getGlobalFrameID(), point, map_pose)) {
-      throw nav2_core::PlannerException("Path transform failed during collision checking");
-    }
-    costmap_frame_local_plan.poses.push_back(map_pose);
-  }
 
   if (obstacle_slowdown_distance_ > 0.0) {
     geometry_msgs::msg::PoseStamped start, carrot;
@@ -659,6 +702,19 @@ double OmniPidPursuitController::approachVelocityScalingFactor(
 void OmniPidPursuitController::applyApproachVelocityScaling(
   const nav_msgs::msg::Path & path, double & linear_vel) const
 {
+  if (obstacle_slowdown_distance_ > 0.0) {
+    // Limit stopping speed directly. Multiplying the current PID output by
+    // remaining/full-speed stopping distance suppresses short-route acceleration.
+    const double remaining = nav2_util::geometry_utils::calculate_path_length(path);
+    const double clearance = std::max(0.0, remaining - obstacle_stop_margin_);
+    const double reaction_velocity = obstacle_deceleration_ * obstacle_reaction_time_;
+    const double stopping_speed = std::sqrt(
+      reaction_velocity * reaction_velocity + 2.0 * obstacle_deceleration_ * clearance) -
+      reaction_velocity;
+    const double limit = std::max(min_approach_linear_velocity_, stopping_speed);
+    linear_vel = std::copysign(std::min(std::abs(linear_vel), limit), linear_vel);
+    return;
+  }
   double approach_vel = linear_vel;
   double velocity_scaling = approachVelocityScalingFactor(path);
   double unbounded_vel = approach_vel * velocity_scaling;

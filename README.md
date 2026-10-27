@@ -25,7 +25,7 @@
 | `use_rotate_to_heading` | Whether to rotate the robot to face the path's direction before moving forward, useful in holonomic robots. |
 | `use_rotate_to_heading_treshold` | The angular threshold at which the robot should rotate in place to align with the desired heading. |
 | `min_approach_linear_velocity` | The minimum linear velocity when approaching the goal to ensure the robot moves slowly when close to its target. |
-| `approach_velocity_scaling_dist` | The distance from the goal where velocity scaling starts when approaching, slowing the robot down as it nears the target. |
+| `approach_velocity_scaling_dist` | Ratio-scaling distance when obstacle distance braking is disabled. With distance braking enabled, remaining path length sets a stopping-speed ceiling. |
 | `v_linear_min` | The minimum translation speed the robot can command, allowing for reverse or slow-forward movement. |
 | `v_linear_max` | The maximum translation speed the robot can command, setting the upper limit for forward movement. |
 | `v_angular_min` | The minimum rotation speed the robot can command, allowing for counter-clockwise rotation. |
@@ -97,6 +97,8 @@ controller_server:
 
 Curvature scaling keeps its factor between zero and one. A lower curve limit takes effect on the next controller command, and the factor recovers gradually when replanning produces a straighter path. This recovery also applies when crossing back below `curvature_min`. Use the Nav2 velocity smoother to enforce physical acceleration and deceleration limits. Goal approach scaling and collision stops remain active.
 
+With distance braking enabled, goal approach speed is bounded directly by remaining path length, `obstacle_deceleration`, `obstacle_reaction_time`, and `obstacle_stop_margin`. Short routes retain normal acceleration up to that bound. The minimum approach speed remains active until the goal-position stop, while obstacle checks can reduce the final command to zero.
+
 ## Obstacle distance braking
 
 `obstacle_slowdown_distance` enables checking a forward path length in meters; its default `0.0` retains the original path collision mode. Odin sets this range from the usable local costmap extent. The controller samples each path segment at half a grid cell and sweeps the robot's circumscribed footprint, including cell area. It also checks the direct pursuit segment toward the lookahead point. Occupied cells, unknown cells and the map boundary constrain available travel.
@@ -104,5 +106,7 @@ Curvature scaling keeps its factor between zero and one. A lower curve limit tak
 The commanded speed satisfies `v * obstacle_reaction_time + v² / (2 * obstacle_deceleration) <= distance - obstacle_stop_margin`. Defaults are `0.3 s`, `2.0 m/s²`, and `0.1 m`, respectively. This limit is applied after goal approach scaling, so an obstacle can reduce the command below the goal's crawl speed and all the way to zero. Current footprint overlap still triggers a collision stop. A future obstruction allows gradual braking and waiting for replanning or clearance. The existing Nav2 smoother limits acceleration when space becomes available again.
 
 These parameters describe static geometry and an assumed braking capability. Dynamic objects are handled through successive costmap observations. The speed limit uses the geometry in the current observation. Actual stopping travel depends on drive response, data freshness and the configured footprint. Test measured braking before using the full navigation speed. Configure X/Y smoother deceleration consistently with `obstacle_deceleration`.
+
+When the pursuit chord meets an obstacle earlier than the planned path, the controller tries nearer points on that same path by halving the lookahead distance, down to two costmap cells. It selects the first point whose direct segment passes the existing footprint check. The shorter segment also limits speed using the braking equation, with half a cell reserved at its end. If every candidate intersects an obstacle, the existing braking and stopping checks remain in effect. This handles tight bends where a long pursuit chord cuts across an otherwise clear route.
 
 `max_lateral_accel` enables braking before upcoming bends when positive (default `0.0` preserves the original curvature handling). Odin uses `1.5 m/s²`, matching its planar acceleration setting. The controller samples coarse curvature over the forward braking range, computes a turn speed from lateral acceleration, and accounts for deceleration and reaction time before the bend. This applies to intermediate route points as well as the local lookahead. The existing curvature factor stores the resulting limit so replanning past a waypoint restores speed gradually. Final-goal stop checks remain separate.
